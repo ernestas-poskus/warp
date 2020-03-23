@@ -8,6 +8,7 @@ use hyper::{
     header::{CONTENT_ENCODING, CONTENT_LENGTH},
     Body,
 };
+use std::convert::TryFrom;
 
 use crate::filter::{Filter, WrapSealed};
 use crate::reject::IsReject;
@@ -32,6 +33,17 @@ impl From<CompressionAlgo> for HeaderValue {
     }
 }
 
+impl CompressionAlgo {
+    #[inline]
+    fn to_str(&self) -> &'static str {
+        match self {
+            CompressionAlgo::BR => "br",
+            CompressionAlgo::DEFLATE => "deflate",
+            CompressionAlgo::GZIP => "gzip",
+        }
+    }
+}
+
 /// Compression
 #[derive(Clone, Copy, Debug)]
 pub struct Compression<F> {
@@ -40,6 +52,53 @@ pub struct Compression<F> {
 
 // TODO: The implementation of `gzip()`, `deflate()`, and `brotli()` could be replaced with
 // generics or a macro
+
+/// Create a wrapping filter that compresses the Body of a [`Response`](crate::reply::Response)
+/// using whatever value is specified in the `Accept-Encoding` header, adding
+/// `content-encoding: <coding>` to the Response's [`HeaderMap`](hyper::HeaderMap)
+///
+/// # Example
+///
+/// ```
+/// use warp::Filter;
+///
+/// let route = warp::get()
+///     .and(warp::path::end())
+///     .and(warp::fs::file("./README.md"))
+///     .with(warp::compression::auto());
+/// ```
+pub fn auto() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
+    let func = move |props: CompressionProps| {
+        if let Some(ref header) = props.accept_enc {
+            if let Some(encoding) = header.prefered_encoding() {
+                match encoding {
+                    "gzip" => (gzip().func)(props),
+                    "deflate" => (deflate().func)(props),
+                    "br" => (brotli().func)(props),
+                    _ => Response::from_parts(props.head, Body::wrap_stream(props.body)),
+                }
+            } else {
+                Response::from_parts(props.head, Body::wrap_stream(props.body))
+            }
+        } else {
+            Response::from_parts(props.head, Body::wrap_stream(props.body))
+        }
+    };
+    Compression { func }
+}
+
+fn append_content_encoding(header: Option<HeaderValue>, algo: CompressionAlgo) -> HeaderValue {
+    if let Some(h_val) = header {
+        if let Ok(s) = h_val.to_str() {
+            let new_str = format!("{}, {}", algo.to_str(), s);
+            HeaderValue::try_from(&new_str).unwrap_or_else(|_| algo.into())
+        } else {
+            algo.into()
+        }
+    } else {
+        algo.into()
+    }
+}
 
 /// Create a wrapping filter that compresses the Body of a [`Response`](crate::reply::Response)
 /// using gzip, adding `content-encoding: gzip` to the Response's [`HeaderMap`](hyper::HeaderMap)
@@ -57,10 +116,12 @@ pub struct Compression<F> {
 pub fn gzip() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
         let body = Body::wrap_stream(GzipEncoder::new(props.body));
-        props
-            .head
-            .headers
-            .append(CONTENT_ENCODING, CompressionAlgo::GZIP.into());
+        let header = append_content_encoding(
+            props.head.headers.remove(CONTENT_ENCODING),
+            CompressionAlgo::GZIP,
+        );
+        props.head.headers.append(CONTENT_ENCODING, header);
+
         props.head.headers.remove(CONTENT_LENGTH);
         Response::from_parts(props.head, body)
     };
@@ -83,11 +144,13 @@ pub fn gzip() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
 pub fn deflate() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
         let body = Body::wrap_stream(DeflateEncoder::new(props.body));
-        props
-            .head
-            .headers
-            .append(CONTENT_ENCODING, CompressionAlgo::DEFLATE.into());
+        let header = append_content_encoding(
+            props.head.headers.remove(CONTENT_ENCODING),
+            CompressionAlgo::DEFLATE,
+        );
+        props.head.headers.append(CONTENT_ENCODING, header);
         props.head.headers.remove(CONTENT_LENGTH);
+
         Response::from_parts(props.head, body)
     };
     Compression { func }
@@ -109,11 +172,13 @@ pub fn deflate() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
 pub fn brotli() -> Compression<impl Fn(CompressionProps) -> Response + Copy> {
     let func = move |mut props: CompressionProps| {
         let body = Body::wrap_stream(BrotliEncoder::new(props.body));
-        props
-            .head
-            .headers
-            .append(CONTENT_ENCODING, CompressionAlgo::BR.into());
+        let header = append_content_encoding(
+            props.head.headers.remove(CONTENT_ENCODING),
+            CompressionAlgo::BR,
+        );
+        props.head.headers.append(CONTENT_ENCODING, header);
         props.head.headers.remove(CONTENT_LENGTH);
+
         Response::from_parts(props.head, body)
     };
     Compression { func }
@@ -143,12 +208,14 @@ mod internal {
 
     use bytes::Bytes;
     use futures::{ready, Stream, TryFuture};
+    use headers::HeaderMapExt;
     use hyper::Body;
     use pin_project::pin_project;
 
     use crate::filter::{Filter, FilterBase, Internal};
     use crate::reject::IsReject;
     use crate::reply::{Reply, Response};
+    use crate::route;
 
     use super::Compression;
 
@@ -193,16 +260,7 @@ mod internal {
     pub struct CompressionProps {
         pub(super) body: CompressableBody<Body, hyper::Error>,
         pub(super) head: http::response::Parts,
-    }
-
-    impl From<http::Response<Body>> for CompressionProps {
-        fn from(resp: http::Response<Body>) -> Self {
-            let (head, body) = resp.into_parts();
-            CompressionProps {
-                body: body.into(),
-                head,
-            }
-        }
+        pub(super) accept_enc: Option<headers::AcceptEncoding>,
     }
 
     #[allow(missing_debug_implementations)]
@@ -263,7 +321,16 @@ mod internal {
             let result = ready!(pin.future.try_poll(cx));
             match result {
                 Ok(reply) => {
-                    let resp = (self.compress.func)(reply.into_response().into());
+                    let resp = route::with(|route| {
+                        let acc_enc: Option<headers::AcceptEncoding> = route.headers().typed_get();
+                        let (head, body) = reply.into_response().into_parts();
+                        let compress_props = CompressionProps {
+                            body: body.into(),
+                            head: head,
+                            accept_enc: acc_enc,
+                        };
+                        (self.compress.func)(compress_props)
+                    });
                     Poll::Ready(Ok((Compressed(resp),)))
                 }
                 Err(reject) => Poll::Ready(Err(reject)),
